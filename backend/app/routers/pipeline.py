@@ -46,6 +46,24 @@ class TransformRequest(BaseModel):
 class ValidationRequest(BaseModel):
     records: list[dict[str, Any]]
     source_module: str = ""
+    cycle_id: str | None = None
+
+
+class QualityCheckStartRequest(BaseModel):
+    record: dict[str, Any]
+    source_module: str = ""
+    cycle_id: str | None = None
+
+
+class QualityCheckConfirmRequest(BaseModel):
+    check_id: int
+    passed: bool = True
+    blocked: bool = False
+    failed: int = 0
+    passed_checks: int = 0
+    checks: int = 0
+    score: int = 100
+    details: list[dict[str, Any]] = []
 
 
 @router.post("/webhook-to-lake")
@@ -140,22 +158,94 @@ def pipeline_validate_batch(request: ValidationRequest) -> dict[str, Any]:
     """链路7: 质量批量校验 → 统计报告。
 
     完整覆盖：data_quality_rule → integration_monitor。
+    每条记录的检查结论都会持久化为质量检查凭证，可按监控周期追溯。
     """
     from app.services.data_quality_rule import DataQualityRuleService
     svc = DataQualityRuleService()
-    result = svc.validate_batch(records=request.records, source_module=request.source_module)
+    result = svc.validate_batch(
+        records=request.records,
+        source_module=request.source_module,
+        cycle_id=request.cycle_id,
+    )
     return result
 
 
+@router.post("/quality-check/start")
+def pipeline_quality_check_start(request: QualityCheckStartRequest) -> dict[str, Any]:
+    """质量检查生命周期（一）：启动检查，返回「运行中」凭证。
+
+    并发重试同一次校验时复用同一凭证，不会产生重复检查。
+    """
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    return svc.start_validation(
+        record=request.record,
+        source_module=request.source_module,
+        cycle_id=request.cycle_id,
+    )
+
+
+@router.post("/quality-check/confirm")
+def pipeline_quality_check_confirm(request: QualityCheckConfirmRequest) -> dict[str, Any]:
+    """质量检查生命周期（二）：确认检查结论（通过/失败/阻断）。
+
+    运行中凭证只能被确认一次；重复确认返回已发布的有效结论。
+    """
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    try:
+        return svc.confirm_validation(
+            check_id=request.check_id,
+            result={
+                "passed": request.passed,
+                "blocked": request.blocked,
+                "failed": request.failed,
+                "passed_checks": request.passed_checks,
+                "checks": request.checks,
+                "score": request.score,
+                "details": request.details,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/quality-check/vouchers")
+def pipeline_quality_check_vouchers(cycle_id: str | None = None,
+                                    status: str | None = None) -> dict[str, Any]:
+    """查询质量检查凭证（兼容历史凭证），可按周期/状态过滤。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    items = svc.list_vouchers(cycle_id=cycle_id, status=status)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/quality-monitor/overview")
+def pipeline_quality_monitor_overview(cycle_id: str | None = None) -> dict[str, Any]:
+    """值班监控视图：已确认数据、分母范围、运行中检查、告警与复核台账。"""
+    from app.services.integration_monitor import IntegrationMonitorService
+    svc = IntegrationMonitorService()
+    return svc.get_quality_monitor_overview(cycle_id=cycle_id)
+
+
+@router.get("/quality-review/ledger")
+def pipeline_quality_review_ledger(cycle_id: str | None = None) -> dict[str, Any]:
+    """查询质量复核台账（告警对应检查结果的同步记录）。"""
+    from app.services.quality_review_ledger import QualityReviewLedgerService
+    svc = QualityReviewLedgerService()
+    items = svc.list_entries_for_cycle(cycle_id)
+    return {"items": items, "total": len(items), "stats": svc.ledger_stats()}
+
+
 @router.get("/health-summary")
-def pipeline_health_summary() -> dict[str, Any]:
+def pipeline_health_summary(cycle_id: str | None = None) -> dict[str, Any]:
     """链路8: 全局监控指标聚合 → 健康度评分。
 
     完整覆盖：integration_monitor → call_trace_log → dlq_handler → data_lake_sink。
     """
     from app.services.integration_monitor import IntegrationMonitorService
     svc = IntegrationMonitorService()
-    return svc.collect_global_metrics()
+    return svc.collect_global_metrics(cycle_id=cycle_id)
 
 
 @router.get("/dedup-stats")

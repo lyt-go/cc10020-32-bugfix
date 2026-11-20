@@ -115,6 +115,57 @@ class JsonStore:
                     return True
             return False
 
+    def find_one(self, key: str, predicate) -> dict[str, Any] | None:
+        """按谓词查找单条记录，返回副本；未命中返回 None。"""
+        for record in self.get_all(key):
+            if predicate(record):
+                return dict(record)
+        return None
+
+    def insert_if_absent(self, key: str, predicate, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """原子条件插入：锁内先按谓词检查，已存在则返回既有记录。
+
+        返回 (记录, 是否新插入)。用于并发场景下保证同一业务键
+        （如检查指纹、告警指纹）只落一份数据。
+        """
+        with self._lock:
+            data = self._read_raw(key)
+            records = data.get("records", [])
+            for existing in records:
+                if predicate(existing):
+                    return dict(existing), False
+            max_id = max((int(r.get("id", 0)) for r in records), default=0)
+            record["id"] = max_id + 1
+            record["created_at"] = datetime.now(timezone.utc).isoformat()
+            record["updated_at"] = record["created_at"]
+            records.append(record)
+            data["_meta"]["version"] = data["_meta"].get("version", 0) + 1
+            data["_meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._write_raw(key, data)
+            return dict(record), True
+
+    def update_if(self, key: str, record_id: int, predicate, updates: dict[str, Any]) -> dict[str, Any] | None:
+        """条件更新（compare-and-set）：仅当谓词对当前记录成立时才写入。
+
+        与 update 的区别在于谓词校验和写入在同一把存储锁内完成，
+        供并发确认场景做幂等保护，避免两个请求重复确认同一条结论。
+        条件不成立时返回 None，调用方可据此重新读取最新记录。
+        """
+        with self._lock:
+            data = self._read_raw(key)
+            records = data.get("records", [])
+            for i, record in enumerate(records):
+                if record.get("id") == record_id:
+                    if not predicate(record):
+                        return None
+                    records[i].update(updates)
+                    records[i]["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    data["_meta"]["version"] = data["_meta"].get("version", 0) + 1
+                    data["_meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._write_raw(key, data)
+                    return dict(records[i])
+            return None
+
     def query(self, key: str, filters: dict[str, Any] | None = None,
               keyword: str | None = None, search_fields: list[str] | None = None,
               page: int = 1, size: int = 20) -> tuple[list[dict[str, Any]], int]:
